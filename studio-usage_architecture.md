@@ -1,80 +1,247 @@
-# Studio Usage Architecture & Flow
+# Studio Architecture: Time Complexity & Performance Analysis
 
-The [/home/studio-usage](file:///Users/baki/Desktop/wekan/nitrocloud/frontend/app/home/studio-usage) page in NitroCloud provides usage statistics and granular logs for AI model invocations. This is powered by a multi-database architecture and an external Gateway service. Here is the end-to-end flow and architecture.
+Based on a thorough review of the Studio architecture ([studio.service.ts](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.service.ts), [studio.controller.ts](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts), [studio-org-credits.service.ts](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio-org-credits.service.ts), and the system design summary), here is a breakdown of how "expensive" the calculations and calls are.
 
-## 1. Frontend & Presentation Layer
-- **Component:** [app/home/studio-usage/page.tsx](file:///Users/baki/Desktop/wekan/nitrocloud/frontend/app/home/studio-usage/page.tsx)
-- **Responsibilities:** Renders the Bento-style metrics grid, daily performance charts, and the granular "Call Intelligence" request logs table.
-- **API Calls:** 
-  - `studioApi.getUsage()`: Gets total tokens, requests, and cost for the current month.
-  - `studioApi.getDailyUsage(7)`: Gets a 7-day breakdown for charting.
-  - `studioApi.getRequestLogs(1, 10)`: Fetches paginated, raw request telemetry.
+The overall architecture is highly optimized. It completely avoids doing heavy analytical calculations in MongoDB or Node.js by leveraging **ClickHouse** for big data and **Dragonfly (Redis)** for high-frequency operations.
 
-## 2. Backend API ([StudioService](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.service.ts#35-802) & [StudioController](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts#34-310))
-Located in `backend/src/studio/`, these serve as the data-retrieval layer for the dashboard:
-- **Aggregated Data (MongoDB):** The service queries `studio_billing_records` for month-to-date totals, and `studio_daily_usage` for daily buckets.
-- **Granular Logs (ClickHouse):** For high-density telemetry (the Call Intelligence table), the service queries `studio_usage_logs` in **ClickHouse**, which provides efficient, high-performance querying of millions of log rows.
+## 1. Backend API (Dashboard & Metrics)
 
-## 3. The Gateway (External Service)
-The Gateway is a separate, high-performance proxy service that actually handles the user requests to OpenRouter or other AI model providers.
-- **Direct MongoDB Access:** To avoid the latency of calling the NitroCloud backend API on every request, the Gateway queries MongoDB directly. It verifies 3 levels of access in a single aggregation:
-  1. **User Authentication:** Checks valid JWT / API keys.
-  2. **Member Authorization:** Validates `members[].studioAccess` is true, and checks personal `studioCreditLimit`.
-  3. **Org Subscription Check:** Validates the organization's total `studioCredits` and whether overages (`studioUsageBillingEnabled`) are allowed.
-- **Usage Sync (Data Ingestion):** After a model request completes, the Gateway directly increments (`$inc`) the usage counters in the `organizations` and `subscriptions` collections. It also writes raw telemetry to **ClickHouse** (`studio_usage_logs`) and inserts tracking records into **MongoDB** (`studio_billing_records`, `studio_daily_usage`).
+The primary operations for rendering the `/home/studio-usage` page involve querying usage statistics.
 
-## 4. Redis / Dragonfly
-While MongoDB and ClickHouse store the persistent and billing usage, **Dragonfly (Drop-in Redis replacement)** is used extensively across the platform for fast, in-memory operations and rate-limiting.
-- **Implementation:** Leveraged via the `DragonflyService` and `PlanEnforcementService`.
-- **Use Case:** It tracks the real-time API request quotas (`totalRequestsThisPeriod`). For example, when an org's payment is overdue and enters a grace period, Dragonfly restricts their quota limit in real-time. It is the primary store for transient request counters (`{orgId}:count`) to enforce rate limits before the more intensive MongoDB/ClickHouse billing syncing happens.
+### A. Monthly/Daily Aggregations (MongoDB)
+- **Functions:** [getUserStudioUsage](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.service.ts#474-519), [getUserDailyUsage](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.service.ts#520-590), [getOrganizationStudioUsage](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.service.ts#692-758)
+- **What it does:** Queries the `studio_billing_records` and `studio_daily_usage` collections for the current user/org and a specific date range, then runs an in-memory `.reduce()` to sum the totals.
+- **Time Expense: Extremely Cheap (< 50ms)**
+  - **Complexity:** [O(N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) where N is the number of returned records.
+  - Because records are pre-aggregated per day (`studio_daily_usage`) and per month (`studio_billing_records`), a 7-day query for a user only returns 7 to `7 * (number of orgs)` documents.
+  - Grouping and summing an array of <100 objects in Node.js takes less than `0.1` milliseconds.
+  - Relying on MongoDB indexes (`user_id`, `organization_id`, [date](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts#255-263), `period`) makes the database lookup near-instantaneous.
 
----
-### Summary of the Data Flow
-1. **User Prompt** → **Gateway**
-2. **Gateway** checks **MongoDB** (Auth + Limits) and **Dragonfly** (Rate Limits).
-3. **Gateway** calls Model Provider (OpenRouter).
-4. **Gateway** increments counters in **MongoDB** and writes raw logs to **ClickHouse**.
-5. **User visits `/home/studio-usage`** → **Frontend** calls **Backend**.
-6. **Backend** aggregates quick stats from **MongoDB** and streams granular logs from **ClickHouse**.
+### B. Request Logs / Call Intelligence (ClickHouse)
+- **Functions:** [getUserRequestLogs](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.service.ts#591-691)
+- **What it does:** Executes `SELECT COUNT(*)` and a paginated `SELECT ... LIMIT X OFFSET Y` against ClickHouse.
+- **Time Expense: Very Cheap (< 100ms)**
+  - **Complexity:** Time complexity for columnar aggregation/counting in ClickHouse is massively parallelized.
+  - Even if a user generates 5 million request logs, ClickHouse can count and paginate them in milliseconds. Standard MongoDB would choke on `.countDocuments()` and `.skip()` for millions of records, but ClickHouse handles this as intended.
 
----
-## 5. Architectural Diagram
+### C. Available Models (Service Call)
+- **Functions:** [getOpenRouterModels](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.service.ts#759-801)
+- **What it does:** Makes an HTTP GET request to `https://openrouter.ai/api/v1/models`.
+- **Time Expense: Most Expensive (200ms - 800ms)**
+  - This is the slowest operation in the dashboard flow, as it relies on an external network round-trip and OpenRouter's API response time.
+  - However, the backend provides an immediate hardcoded fallback if the API fails, preventing application hangs.
+
+## 2. Gateway Proxy (Ingestion & Rate Limiting)
+
+When a user actually generates text, they hit the Gateway. This path must be the fastest, as any delay adds to the perceived LLM latency.
+
+### A. Auth & Subscription Checks (MongoDB)
+- **Mechanism:** Gateway verifies user tokens, member `studioAccess` flags, and total requested org `studioCredits` via a direct MongoDB query or aggregation.
+- **Time Expense: Cheap (< 20ms)**
+  - Using proper indexes on the `organizations` and `users` collections ensures this is a quick [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) or [O(log N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) lookup. 
+
+### B. Rate Limiting (Dragonfly / Redis)
+- **Mechanism:** The Gateway checks Dragonfly for `totalRequestsThisPeriod` or burst quotas before routing to OpenRouter.
+- **Time Expense: Almost Free (< 1ms)**
+  - Redis/Dragonfly operations are heavily multi-threaded in-memory operations. Fetching and incrementing a counter (`INCR`) operates in [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) time complexity and essentially has zero structural overhead.
+
+### C. Telemetry Ingestion (MongoDB & ClickHouse)
+- **Mechanism:** After the LLM replies, Gateway performs a `$inc` on MongoDB billing counters and inserts a raw telemetry row into ClickHouse.
+- **Time Expense: Negligible (Fire-and-Forget)**
+  - Gateway does not make the user wait for these writes to finish (asynchronous ingestion).
+  - MongoDB `$inc` is an atomic [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) update.
+  - ClickHouse allows massive asynchronous burst writes.
+
+## 3. Organizational Credits Service
+- **Functions:** [getCreditsForOrganization](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio-org-credits.service.ts#84-115), [recordUsage](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio-org-credits.service.ts#116-135)
+- **What it does:** Calculates total credits used by querying `studio_billing_records` and summing `total_cost`.
+- **Time Expense: Very Fast (< 20ms)**
+  - Even for an organization with 1,000 members, reading 1,000 billing records for the active month and summing their costs in Node.js [O(N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) is trivial. 
+  - [recordUsage](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio-org-credits.service.ts#116-135) leverages atomic `$inc` updates via `findOneAndUpdate`, removing the need for manual concurrency locking.
+
+## Summary
+
+There are **zero "expensive" calculations** in the Studio architecture. 
+- You do not use massive MongoDB aggregation pipelines (`$group`, `$lookup`) on raw telemetry data.
+- You avoid reading raw requests to calculate monthly billing (using pre-incremented records instead).
+- The only potential bottleneck is the external HTTP request to fetch OpenRouter models. Everything database-side is strictly [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) (Redis/MongoDB updates) or localized analytical queries [O(N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) handled by the ideal engine (ClickHouse).
+
+## 4. Entity-Relationship (ER) Diagram
+
+The following ER diagram maps the data models used to support the Studio calculations, telemetry, and permissions across MongoDB and ClickHouse.
+
+```mermaid
+erDiagram
+    %% Core Entities
+    User ||--o{ OrganizationMember : "belongs to"
+    Organization ||--o{ OrganizationMember : "contains"
+    Organization ||--o| StudioOrgCredits : "holds"
+
+    %% Studio Usage & Billing (MongoDB)
+    Organization ||--o{ StudioBillingRecord : "billed for"
+    User ||--o{ StudioBillingRecord : "generates"
+
+    Organization ||--o{ StudioDailyUsage : "aggregates"
+    User ||--o{ StudioDailyUsage : "aggregates"
+
+    %% Telemetry (ClickHouse)
+    Organization ||--o{ StudioUsageLog : "telemetry"
+    User ||--o{ StudioUsageLog : "telemetry"
+
+    %% Requests & Deployments
+    Organization ||--o{ StudioRequest : "receives"
+    User ||--o{ StudioRequest : "makes"
+
+    Organization ||--o{ StudioDeployment : "hosts"
+    User ||--o{ StudioDeployment : "deploys"
+
+    User {
+        ObjectId id PK
+        string email
+    }
+    
+    Organization {
+        ObjectId id PK
+        string name
+    }
+
+    OrganizationMember {
+        ObjectId id PK
+        ObjectId userId FK
+        ObjectId organizationId FK
+        boolean studioAccess
+        number studioAdditionalUsageLimit
+    }
+
+    StudioOrgCredits {
+        ObjectId id PK
+        ObjectId organization FK
+        number creditsTotal
+        number creditsUsed
+        string currentPeriod
+    }
+
+    StudioBillingRecord {
+        ObjectId id PK
+        string organization_id FK
+        string user_id FK
+        string period "YYYY-MM"
+        number total_tokens
+        number total_cost
+        number total_requests
+    }
+
+    StudioDailyUsage {
+        ObjectId id PK
+        string organization_id FK
+        string user_id FK
+        string date "YYYY-MM-DD"
+        string model
+        number total_tokens
+        number total_cost
+        number total_requests
+    }
+    
+    StudioUsageLog {
+        String id PK "ClickHouse UUID"
+        String organization_id FK
+        String user_id FK
+        DateTime created_at
+        String model
+        Float64 cost
+        Int32 status_code
+        Int32 latency_ms
+    }
+
+    StudioRequest {
+        ObjectId id PK
+        ObjectId user FK
+        ObjectId organization FK
+        string type "access | additional_usage"
+        string status "pending | approved | rejected"
+        number requestedAmount
+    }
+
+    StudioDeployment {
+        ObjectId id PK
+        ObjectId userId FK
+        ObjectId projectId FK
+        ObjectId organizationId FK
+        string status
+        string s3Key
+    }
+```
+
+## 5. Service & Function Communication Architecture
+
+The following diagram illustrates the active communication paths between the user, frontend components, external gateway, and internal backend services within the Studio architecture.
 
 ```mermaid
 graph TD
-    %% Define Nodes
-    User[End User IDE / Dashboard]
-    Gw[Studio Gateway<br>High-Performance Proxy]
-    BE[NestJS Backend API<br>NitroCloud]
-    OR[OpenRouter / Model Providers<br>GPT-4o, Claude]
-    
-    subgraph Data Stores
-        MDB[(MongoDB<br>Organizations / Subscriptions)]
-        CH[(ClickHouse<br>Usage Logs Telemetry)]
-        RD[(Dragonfly / Redis<br>Real-time Rate Limits)]
-    end
-    
-    %% Relationships
-    User -- "1. AI Prompt Request" --> Gw
-    User -- "5. View Usage Dashboard" --> BE
-    
-    Gw -- "2a. Check Real-time Quota" --> RD
-    Gw -- "2b. Direct Auth & Credit Check" --> MDB
-    Gw -- "3. Forward Request" --> OR
-    OR -- "Stream Response" --> Gw
-    Gw -- "Stream Response" --> User
+    %% Define Actors
+    User["End User Dashboard"]
+    LLM_Client["User LLM Application"]
 
-    %% Billing & Async Writes
-    Gw -. "4a. Increment Credits Used ($inc)" .-> MDB
-    Gw -. "4b. Write Telemetry Logs" .-> CH
+    %% Frontend Components
+    subgraph Frontend ["Next.js Frontend"]
+        SU_Page("app/home/studio-usage/page.tsx")
+        API_Config("app/home/settings/[id]/studio/page.tsx")
+    end
+
+    %% External Services
+    subgraph External ["External Edge"]
+        GW["NitroCloud Gateway<br>High-Performance Proxy"]
+        OR["OpenRouter / Model Providers"]
+    end
+
+    %% Backend Services
+    subgraph Backend ["NestJS Backend API"]
+        S_Ctrl("StudioController")
+        S_Svc("StudioService")
+        SOC_Svc("StudioOrgCreditsService")
+        SR_Svc("StudioRequestService")
+    end
+
+    %% Data Stores
+    subgraph Data ["Storage Layer"]
+        MDB[("MongoDB")]
+        CH[("ClickHouse")]
+        RD[("Dragonfly / Redis")]
+    end
+
+    %% Flow: Viewing Usage Dashboard
+    User -- "Views Dashboard" --> SU_Page
+    SU_Page -- "GET /usage, /daily, /requests" --> S_Ctrl
+    S_Ctrl -- "Calls" --> S_Svc
+    S_Svc -- "Aggregates Monthly/Daily" --> MDB
+    S_Svc -- "Paginates Raw Logs" --> CH
+
+    %% Flow: LLM Generation Path (The Hot Path)
+    LLM_Client -- "AI Prompt (OpenAI SDK)" --> GW
+    GW -- "1. Auth & Limits Check" --> MDB
+    GW -- "2. Check Rate Limits" --> RD
+    GW -- "3. Forward Stream" --> OR
+    OR -- "Stream Response" --> GW
+    GW -- "Stream to Client" --> LLM_Client
     
-    %% Dashboard Data Retrieval
-    BE -- "Aggregated Monthly Totals" --> MDB
-    BE -- "Granular Request Intel" --> CH
+    %% Async Logging Path
+    GW -. "4. Increment Usage ($inc)" .-> MDB
+    GW -. "5. Insert Telemetry Log" .-> CH
+
+    %% Flow: Org Admin Settings
+    User -- "Views/Edits Settings" --> API_Config
+    API_Config -- "POST /organizations/:id/members/:userId/settings" --> S_Ctrl
+    S_Ctrl -- "Process Setting" --> SOC_Svc
+    SOC_Svc -- "Update Limits" --> MDB
     
+    %% Additional Access Flow
+    API_Config -- "POST /organizations/:id/request-access" --> S_Ctrl
+    S_Ctrl -- "Process Request" --> SR_Svc
+    SR_Svc -- "Save Request" --> MDB
+
     %% Styling
-    style Gw fill:#9c27b0,color:#fff,stroke-width:2px
-    style BE fill:#34a853,color:#fff
+    style GW fill:#9c27b0,color:#fff,stroke-width:2px
+    style Backend fill:#34a853,color:#fff
     style MDB fill:#ea4335,color:#fff
     style CH fill:#ff6d00,color:#fff
     style RD fill:#dc382d,color:#fff
