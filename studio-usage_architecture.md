@@ -12,7 +12,7 @@ The primary operations for rendering the `/home/studio-usage` page involve query
 - **Functions:** [getUserStudioUsage](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.service.ts#474-519), [getUserDailyUsage](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.service.ts#520-590), [getOrganizationStudioUsage](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.service.ts#692-758)
 - **What it does:** Queries the `studio_billing_records` and `studio_daily_usage` collections for the current user/org and a specific date range, then runs an in-memory `.reduce()` to sum the totals.
 - **Time Expense: Extremely Cheap (< 50ms)**
-  - **Complexity:** [O(N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) where N is the number of returned records.
+  - **Complexity:** [O(N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts#48-52) where N is the number of returned records.
   - Because records are pre-aggregated per day (`studio_daily_usage`) and per month (`studio_billing_records`), a 7-day query for a user only returns 7 to `7 * (number of orgs)` documents.
   - Grouping and summing an array of <100 objects in Node.js takes less than `0.1` milliseconds.
   - Relying on MongoDB indexes (`user_id`, `organization_id`, [date](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts#255-263), `period`) makes the database lookup near-instantaneous.
@@ -38,25 +38,25 @@ When a user actually generates text, they hit the Gateway. This path must be the
 ### A. Auth & Subscription Checks (MongoDB)
 - **Mechanism:** Gateway verifies user tokens, member `studioAccess` flags, and total requested org `studioCredits` via a direct MongoDB query or aggregation.
 - **Time Expense: Cheap (< 20ms)**
-  - Using proper indexes on the `organizations` and `users` collections ensures this is a quick [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) or [O(log N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) lookup. 
+  - Using proper indexes on the `organizations` and `users` collections ensures this is a quick [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts#48-52) or [O(log N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts#48-52) lookup. 
 
 ### B. Rate Limiting (Dragonfly / Redis)
 - **Mechanism:** The Gateway checks Dragonfly for `totalRequestsThisPeriod` or burst quotas before routing to OpenRouter.
 - **Time Expense: Almost Free (< 1ms)**
-  - Redis/Dragonfly operations are heavily multi-threaded in-memory operations. Fetching and incrementing a counter (`INCR`) operates in [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) time complexity and essentially has zero structural overhead.
+  - Redis/Dragonfly operations are heavily multi-threaded in-memory operations. Fetching and incrementing a counter (`INCR`) operates in [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts#48-52) time complexity and essentially has zero structural overhead.
 
 ### C. Telemetry Ingestion (MongoDB & ClickHouse)
 - **Mechanism:** After the LLM replies, Gateway performs a `$inc` on MongoDB billing counters and inserts a raw telemetry row into ClickHouse.
 - **Time Expense: Negligible (Fire-and-Forget)**
   - Gateway does not make the user wait for these writes to finish (asynchronous ingestion).
-  - MongoDB `$inc` is an atomic [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) update.
+  - MongoDB `$inc` is an atomic [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts#48-52) update.
   - ClickHouse allows massive asynchronous burst writes.
 
 ## 3. Organizational Credits Service
 - **Functions:** [getCreditsForOrganization](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio-org-credits.service.ts#84-115), [recordUsage](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio-org-credits.service.ts#116-135)
 - **What it does:** Calculates total credits used by querying `studio_billing_records` and summing `total_cost`.
 - **Time Expense: Very Fast (< 20ms)**
-  - Even for an organization with 1,000 members, reading 1,000 billing records for the active month and summing their costs in Node.js [O(N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) is trivial. 
+  - Even for an organization with 1,000 members, reading 1,000 billing records for the active month and summing their costs in Node.js [O(N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts#48-52) is trivial. 
   - [recordUsage](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio-org-credits.service.ts#116-135) leverages atomic `$inc` updates via `findOneAndUpdate`, removing the need for manual concurrency locking.
 
 ## Summary
@@ -64,7 +64,7 @@ When a user actually generates text, they hit the Gateway. This path must be the
 There are **zero "expensive" calculations** in the Studio architecture. 
 - You do not use massive MongoDB aggregation pipelines (`$group`, `$lookup`) on raw telemetry data.
 - You avoid reading raw requests to calculate monthly billing (using pre-incremented records instead).
-- The only potential bottleneck is the external HTTP request to fetch OpenRouter models. Everything database-side is strictly [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) (Redis/MongoDB updates) or localized analytical queries [O(N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/schemas/studio-org-credits.schema.ts#15-38) handled by the ideal engine (ClickHouse).
+- The only potential bottleneck is the external HTTP request to fetch OpenRouter models. Everything database-side is strictly [O(1)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts#48-52) (Redis/MongoDB updates) or localized analytical queries [O(N)](file:///Users/baki/Desktop/wekan/nitrocloud/backend/src/studio/studio.controller.ts#48-52) handled by the ideal engine (ClickHouse).
 
 ## 4. Entity-Relationship (ER) Diagram
 
@@ -76,6 +76,11 @@ erDiagram
     User ||--o{ OrganizationMember : "belongs to"
     Organization ||--o{ OrganizationMember : "contains"
     Organization ||--o| StudioOrgCredits : "holds"
+
+    %% Gateway Service Role
+    Gateway ||--o{ StudioUsageLog : "writes telemetry to"
+    Gateway ||--o{ StudioBillingRecord : "increments usage in"
+    Gateway ||--o{ StudioDailyUsage : "increments usage in"
 
     %% Studio Usage & Billing (MongoDB)
     Organization ||--o{ StudioBillingRecord : "billed for"
@@ -94,6 +99,11 @@ erDiagram
 
     Organization ||--o{ StudioDeployment : "hosts"
     User ||--o{ StudioDeployment : "deploys"
+
+    Gateway {
+        string service "NitroCloud Proxy"
+        string role "Ingestion & Rate Limiting"
+    }
 
     User {
         ObjectId id PK
