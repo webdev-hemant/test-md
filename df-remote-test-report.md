@@ -16,6 +16,21 @@
 
 ---
 
+## Overview
+
+All **44 tests** pass (32 unit + 12 integration).
+
+Integration tests connected to real Dragonfly + MongoDB via `.env`, with Studio + Gateway running on local:
+
+- ✅ DragonflyStore CRUD (org + member)
+- ✅ Lua dollar credit scripts (5 scenarios: allowed, exhausted, overage, overage limit, member limit)
+- ✅ Lua token credit scripts (3 scenarios: OK, exhausted, no limit)
+- ✅ Rate limiting
+- ✅ SeedFromMongo (65 orgs, 76 members)
+- ✅ Reconciler RunOnce (full pass in 70s)
+
+---
+
 ## Unit Tests — `internal/store` (32 tests, 0.685s)
 
 ### types_test.go — OrgState & MemberState Helpers
