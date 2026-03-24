@@ -4,22 +4,21 @@
 
 ## Summary
 
-| Package | Tests | Passed | Failed | Duration |
-|---------|-------|--------|--------|----------|
-| `internal/store` | 32 | 32 | 0 | 0.685s |
-| `internal/models` | 1 | 1 | 0 | 0.493s |
-| `internal/repository` | 3 (30 sub) | 3 | 0 | 0.708s |
-| **Total** | **63** | **63** | **0** | **1.886s** |
+| Package | Tests | Passed | Failed | Duration | Type |
+|---------|-------|--------|--------|----------|------|
+| `internal/store` (unit) | 32 | 32 | 0 | 0.685s | Unit |
+| `internal/store` (integration) | 12 | 12 | 0 | 252.1s | Integration |
+| `internal/models` | 1 | 1 | 0 | 0.493s | Unit |
+| `internal/repository` | 3 (30 sub) | 3 | 0 | 0.708s | Unit |
+| **Total** | **48 (75 with sub-tests)** | **48** | **0** | — |
 
 **Result: ✅ ALL TESTS PASSED**
 
 ---
 
-## Detailed Results
+## Unit Tests — `internal/store` (32 tests, 0.685s)
 
-### `internal/store` — Dragonfly Store (32 tests)
-
-#### types_test.go — OrgState & MemberState Helpers
+### types_test.go — OrgState & MemberState Helpers
 
 | # | Test | Sub-tests | Result |
 |---|------|-----------|--------|
@@ -30,7 +29,7 @@
 | 5 | `TestMemberState_HasAccess` | granted, denied | ✅ PASS |
 | 6 | `TestMemberState_PersonalLimit` | no_limit, ignores_additional, zero, with_additional, without_additional | ✅ PASS |
 
-#### dragonfly_helpers_test.go — Parsing, Serialization & Key Utils
+### dragonfly_helpers_test.go — Parsing, Serialization & Key Utils
 
 | # | Test | Sub-tests | Result |
 |---|------|-----------|--------|
@@ -47,7 +46,7 @@
 | 17 | `TestParseInt64` | positive, negative, zero, empty, whitespace, invalid | ✅ PASS |
 | 18 | `TestParseInt` | valid, zero, empty, whitespace, invalid | ✅ PASS |
 
-#### seed_helpers_test.go — BSON float64→int64 Decode Verification
+### seed_helpers_test.go — BSON float64→int64 Decode Verification
 
 | # | Test | Validates | Result |
 |---|------|-----------|--------|
@@ -60,42 +59,104 @@
 
 ---
 
-### `internal/models` — Organization Models (1 test)
+## Integration Tests — `internal/store` (12 tests, 252.1s)
+
+> Requires: Dragonfly + MongoDB (via `.env`)  
+> Run with: `go test ./internal/store/ -tags integration -v -timeout 300s`
+
+### Connectivity
+
+| # | Test | Duration | Result |
+|---|------|----------|--------|
+| 1 | `TestIntegration_DragonflyPing` | 6.56s | ✅ PASS |
+
+### DragonflyStore CRUD
+
+| # | Test | Duration | Result |
+|---|------|----------|--------|
+| 2 | `TestIntegration_OrgState_CRUD` | 8.62s | ✅ PASS |
+| 3 | `TestIntegration_MemberState_CRUD` | 8.61s | ✅ PASS |
+
+### Lua Scripts — Dollar Credits
+
+| # | Test | Scenario | Duration | Result |
+|---|------|----------|----------|--------|
+| 4 | `TestIntegration_DollarCredits_Allowed` | Within plan credits | 8.77s | ✅ PASS |
+| 5 | `TestIntegration_DollarCredits_OrgExhausted` | No credits, no overage | 7.14s | ✅ PASS |
+| 6 | `TestIntegration_DollarCredits_Overage` | Credits gone, overage enabled | 7.21s | ✅ PASS |
+| 7 | `TestIntegration_DollarCredits_OverageLimit` | Overage hard limit hit | 8.08s | ✅ PASS |
+| 8 | `TestIntegration_DollarCredits_MemberExhausted` | Member personal limit hit | 8.12s | ✅ PASS |
+
+### Lua Scripts — Token Credits
+
+| # | Test | Scenario | Duration | Result |
+|---|------|----------|----------|--------|
+| 9 | `TestIntegration_TokenCredits` | Increment within limit | 8.09s | ✅ PASS |
+| 10 | `TestIntegration_TokenCredits_Exhausted` | Tokens exhausted | 8.04s | ✅ PASS |
+| 11 | `TestIntegration_TokenCredits_NoLimit` | No limit configured | 6.71s | ✅ PASS |
+
+### Rate Limiting
+
+| # | Test | Duration | Result |
+|---|------|----------|--------|
+| 12 | `TestIntegration_RateLimit` | 7.77s | ✅ PASS |
+
+### Seed from MongoDB
+
+| # | Test | Result | Details |
+|---|------|--------|---------|
+| 13 | `TestIntegration_SeedFromMongo` | ✅ PASS (44.43s) | 65 orgs, 76 members seeded from MongoDB |
+
+### Reconciler
+
+| # | Test | Result | Details |
+|---|------|--------|---------|
+| 14 | `TestIntegration_Reconciler_RunOnce` | ✅ PASS (113.28s) | Full reconcile pass: 0 updates needed, 0 orphans |
+
+---
+
+## Unit Tests — Other Packages
+
+### `internal/models` (1 test)
 
 | # | Test | Result |
 |---|------|--------|
 | 1 | `TestConvertLegacyMember` | ✅ PASS |
 
----
-
-### `internal/repository` — MongoDB Repository (3 tests, 30 sub-tests)
-
-#### membership_test.go
+### `internal/repository` (3 tests, 30 sub-tests)
 
 | # | Test | Sub-tests | Result |
 |---|------|-----------|--------|
-| 1 | `TestGetOrganizationMembership` | found, legacy_user_field, credit_limit, no_studioAccess, legacy_fallback, correct_legacy, not_found, empty_legacy, nil_legacy, db_error, invalid_orgID, invalid_userID | ✅ PASS |
-| 2 | `TestMembershipRawToMembership` | canonical, legacy_normalize, both_fields, all_studio_fields | ✅ PASS |
-| 3 | `TestIncrementMemberCreditsUsed` | found, legacy_fallback, legacy_field, not_found, db_errors (×3), invalid_orgID, invalid_userID | ✅ PASS |
-
-#### migration_test.go
-
-| # | Test | Sub-tests | Result |
-|---|------|-----------|--------|
-| 4 | `TestMigrateEmbeddedMembers` | all_created, idempotent, mixed_duplicates, empty, normalized, query_failure, insert_error, multiple_orgs, mixed_write_errors | ✅ PASS |
+| 1 | `TestGetOrganizationMembership` | 12 sub-tests | ✅ PASS |
+| 2 | `TestMembershipRawToMembership` | 4 sub-tests | ✅ PASS |
+| 3 | `TestIncrementMemberCreditsUsed` | 9 sub-tests | ✅ PASS |
+| 4 | `TestMigrateEmbeddedMembers` | 9 sub-tests | ✅ PASS |
 
 ---
 
-## Test Coverage Notes
+## How to Run
 
-| Area | Covered | Not Covered (requires external deps) |
-|------|---------|--------------------------------------|
-| OrgState/MemberState helpers | ✅ | — |
-| State serialization round-trips | ✅ | — |
-| Key builders & parsers | ✅ | — |
-| BSON float64→int64 decode fix | ✅ | — |
-| Utility functions | ✅ | — |
-| DragonflyStore CRUD | — | Requires Redis/Dragonfly |
-| Lua credit scripts | — | Requires Redis/Dragonfly |
-| Seed from MongoDB | — | Requires MongoDB |
-| Reconciler loop | — | Requires MongoDB + Dragonfly |
+```bash
+# Unit tests only (fast, no external deps)
+cd gateway && go test ./internal/... -v -count=1
+
+# Integration tests (requires Dragonfly + MongoDB via .env)
+cd gateway && go test ./internal/store/ -tags integration -v -timeout 300s
+
+# All tests
+cd gateway && go test ./internal/... -tags integration -v -timeout 300s
+```
+
+---
+
+## Test File Summary
+
+| File | Type | Tests | Source |
+|------|------|-------|--------|
+| `internal/store/types_test.go` | Unit | 8 | OrgState/MemberState helpers |
+| `internal/store/dragonfly_helpers_test.go` | Unit | 18 | Parsing, serialization, keys |
+| `internal/store/seed_helpers_test.go` | Unit | 6 | BSON float64 decode fix |
+| `internal/store/store_integration_test.go` | Integration | 12 | CRUD, Lua scripts, Seed, Reconciler |
+| `internal/models/organization_test.go` | Unit | 1 | Legacy member conversion |
+| `internal/repository/membership_test.go` | Unit | 3 (25 sub) | Membership CRUD |
+| `internal/repository/migration_test.go` | Unit | 1 (9 sub) | Member migration |
