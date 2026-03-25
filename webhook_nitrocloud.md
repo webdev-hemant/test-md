@@ -1,5 +1,8 @@
 # Gateway Dragonfly Webhook Integration
 
+> [!TIP]
+> **TL;DR:** When NitroCloud mutates billing or member state in MongoDB, it calls the Gateway's `/internal/events/*` webhooks to **immediately re-seed** the Dragonfly cache, bypassing the 5-minute reconciliation cycle.
+
 ## Overview
 
 NitroStudio Gateway uses **DragonflyDB** (Redis-compatible) as a hot-path cache for organization credits, member access control, and rate limiting. When the NitroCloud backend mutates billing or membership state in MongoDB, the gateway's Dragonfly cache must be notified so it can re-seed immediately — instead of waiting for the periodic reconciliation cycle (every 5 minutes).
